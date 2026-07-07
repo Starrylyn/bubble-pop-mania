@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>泡泡大作战 · Bubble Pop Mania</title>
+<style>
+  *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    width:100%; height:100%; overflow:hidden;
+    background:#FDF6F0;
+    font-family: -apple-system, 'PingFang SC', 'Noto Sans SC', sans-serif;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none; user-select: none;
+  }
+  #wrapper {
+    position:relative; width:100%; height:100%;
+    display:flex; align-items:center; justify-content:center;
+  }
+  canvas { display:block; border-radius:20px; }
+  #fallback {
+    display:none; position:absolute; inset:0; z-index:10;
+    background:#FDF6F0; flex-direction:column; align-items:center; justify-content:center;
+    padding:40px; text-align:center; color:#5C4033;
+  }
+  #fallback h2 { font-size:1.4rem; margin-bottom:12px; color:#E8784A; }
+  #fallback p { font-size:1rem; line-height:1.6; max-width:320px; }
+</style>
+</head>
+<body>
+<div id="wrapper">
+  <canvas id="game"></canvas>
+</div>
+<div id="fallback">
+  <h2>🫧 哎呀，你的浏览器不支持 Canvas</h2>
+  <p>泡泡大作战需要 Canvas 才能游玩。<br>请用 Chrome、Safari、Firefox 或手机浏览器打开吧～</p>
+</div>
+<script>
+'use strict';
+
+// ─── Error Boundaries ──────────────────────────────────
+(function checkEnv() {
+  const c = document.createElement('canvas');
+  if (!c.getContext || !c.getContext('2d')) {
+    document.getElementById('wrapper').style.display = 'none';
+    document.getElementById('fallback').style.display = 'flex';
+    throw new Error('Canvas not supported');
+  }
+})();
+
+const storageSupported = (() => {
+  try { const t = '__bst__'; localStorage.setItem(t, '1'); localStorage.removeItem(t); return true; }
+  catch (e) { return false; }
+})();
+
+const audioSupported = (() => {
+  try { return !!new (window.AudioContext || window.webkitAudioContext)(); }
+  catch (e) { return false; }
+})();
+
+// ─── State Machine ──────────────────────────────────────
+const STATE = { MENU: 'menu', PLAYING: 'playing', PAUSED: 'paused', OVER: 'over' };
+let gameState = STATE.MENU;
+let canvas, ctx, W, H;
+
+// ─── Audio ──────────────────────────────────────────────
+let audioCtx = null;
+function initAudio() {
+  if (!audioSupported) return;
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function playPop(freq = 600, dur = 0.08, vol = 0.15) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(freq, t);
+  osc.frequency.exponentialRampToValueAtTime(freq * 1.5, t + dur * 0.3);
+  osc.frequency.exponentialRampToValueAtTime(freq * 0.5, t + dur);
+  gain.gain.setValueAtTime(vol, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  osc.start(t); osc.stop(t + dur);
+}
+
+function playCombo(level) {
+  if (!audioCtx) return;
+  const baseFreq = 400 + level * 80;
+  for (let i = 0; i < 3; i++) {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.connect(g); g.connect(audioCtx.destination);
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(baseFreq + i * 100, audioCtx.currentTime + i * 0.06);
+    g.gain.setValueAtTime(0.12, audioCtx.currentTime + i * 0.06);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + i * 0.06 + 0.1);
+    o.start(audioCtx.currentTime + i * 0.06);
+    o.stop(audioCtx.currentTime + i * 0.06 + 0.1);
+  }
+}
+
+function playGameOver() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const notes = [400, 350, 300, 200];
+  notes.forEach((f, i) => {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.connect(g); g.connect(audioCtx.destination);
+    o.type = 'sine';
+    o.frequency.value = f;
+    g.gain.setValueAtTime(0.15, t + i * 0.15);
+    g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.15 + 0.25);
+    o.start(t + i * 0.15); o.stop(t + i * 0.15 + 0.25);
+  });
+}
+
+// ─── Score / High Score ─────────────────────────────────
+let score = 0;
+let highScore = 0;
+function loadHighScore() {
+  if (!storageSupported) return;
+  try {
+    const v = localStorage.getItem('bubblepopmania_high');
+    if (v !== null) highScore = Math.max(0, parseInt(v, 10) || 0);
+  } catch (e) { /* storage unavailable fallback */ }
+}
+function saveHighScore() {
+  if (!storageSupported) return;
+  try { localStorage.setItem('bubblepopmania_high', String(highScore)); }
+  catch (e) { /* storage full or unavailable — silently degrade */ }
+}
+loadHighScore();
+
+function updateHighScore() {
+  if (score > highScore) {
+    highScore = score;
+    saveHighScore();
+    return true;
+  }
+  return false;
+}
+
+// ─── Game Data ───────────────────────────────────────────
+let bubbles = [];
+let particles = [];
+let floatingBg = [];
+let timer = 60;
+let comboTimer = 0;
+let comboCount = 0;
+let maxCombo = 0;
+let totalPopped = 0;
+
+const BUBBLE_TYPES = {
+  regular: { color: '#FF8C69', glow: '#FFB6A3', score: 10, radius: 28 },
+  golden: { color: '#FFD700', glow: '#FFF0A0', score: 50, radius: 22 },
+  bomb:   { color: '#E8784A', glow: '#FFA07A', score: -15, radius: 30 },
+  freeze: { color: '#87CEEB', glow: '#B0E0E6', score: 5, radius: 26 },
+};
+
+let freezeActive = false;
+let freezeTimer = 0;
+
+// ─── Bubble Sprite ───────────────────────────────────────
+class Bubble {
+  constructor(type) {
+    const t = BUBBLE_TYPES[type];
+    this.type = type;
+    this.x = Math.random() * (W - t.radius * 2) + t.radius;
+    this.y = H + t.radius + Math.random() * 200;
+    this.r = t.radius;
+    this.baseR = t.radius;
+    this.color = t.color;
+    this.glow = t.glow;
+    this.score = t.score;
+    this.speed = 0.6 + Math.random() * 1.2;
+    this.wobble = Math.random() * Math.PI * 2;
+    this.wobbleSpeed = 0.01 + Math.random() * 0.02;
+    this.wobbleAmp = 0.3 + Math.random() * 0.5;
+    this.popped = false;
+    this.scale = 1;
+    this.popAnim = 0;
+    this.bob = Math.random() * Math.PI * 2;
+  }
+
+  update() {
+    if (this.popped) {
+      this.popAnim += 0.08;
+      this.scale = 1 - this.popAnim;
+      return this.popAnim >= 1;
+    }
+    const spd = freezeActive ? this.speed * 0.3 : this.speed;
+    this.y -= spd;
+    this.bob += 0.03;
+    this.wobble += this.wobbleSpeed;
+    this.x += Math.sin(this.wobble) * this.wobbleAmp;
+    return this.y + this.r < -20;
+  }
+
+  draw(ctx) {
+    if (this.popped) {
+      ctx.save();
+      ctx.globalAlpha = 1 - this.popAnim;
+      ctx.translate(this.x, this.y);
+      ctx.scale(this.scale, this.scale);
+      ctx.beginPath(); ctx.arc(0, 0, this.r, 0, Math.PI * 2);
+      ctx.fillStyle = this.color; ctx.fill();
+      ctx.restore();
+      return;
+    }
+    const bobY = this.y + Math.sin(this.bob) * 3;
+    ctx.save();
+    // Outer glow
+    ctx.shadowColor = this.glow;
+    ctx.shadowBlur = 16;
+    // Main bubble
+    ctx.beginPath();
+    ctx.arc(this.x, bobY, this.r, 0, Math.PI * 2);
+    const grad = ctx.createRadialGradient(this.x - this.r * 0.3, bobY - this.r * 0.3, this.r * 0.1, this.x, bobY, this.r);
+    grad.addColorStop(0, this.glow);
+    grad.addColorStop(0.7, this.color);
+    grad.addColorStop(1, this.color + '80');
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    // Highlight
+    ctx.beginPath();
+    ctx.arc(this.x - this.r * 0.28, bobY - this.r * 0.28, this.r * 0.22, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fill();
+    // Icon
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = `${this.r * 0.9}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const icons = { regular: '🫧', golden: '⭐', bomb: '💥', freeze: '❄️' };
+    ctx.fillText(icons[this.type], this.x, bobY);
+    ctx.restore();
+  }
+
+  hit(px, py) {
+    const dx = this.x - px, dy = (this.y + Math.sin(this.bob) * 3) - py;
+    return Math.sqrt(dx * dx + dy * dy) < this.r + 4;
+  }
+}
+
+// ─── Particle ────────────────────────────────────────────
+class Particle {
+  constructor(x, y, color) {
+    this.x = x; this.y = y;
+    this.vx = (Math.random() - 0.5) * 6;
+    this.vy = (Math.random() - 0.5) * 6 - 2;
+    this.life = 0.5 + Math.random() * 0.5;
+    this.maxLife = this.life;
+    this.color = color;
+    this.r = 2 + Math.random() * 4;
+  }
+  update(dt) {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vy += 0.05;
+    this.life -= dt;
+    return this.life <= 0;
+  }
+  draw(ctx) {
+    ctx.save();
+    ctx.globalAlpha = this.life / this.maxLife;
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ─── Floating Background ─────────────────────────────────
+class FloatBg {
+  constructor() { this.reset(true); }
+  reset(init) {
+    this.x = Math.random() * W;
+    this.y = init ? Math.random() * H : H + 20;
+    this.r = 3 + Math.random() * 6;
+    this.speed = 0.3 + Math.random() * 0.6;
+    this.alpha = 0.08 + Math.random() * 0.12;
+    this.wobble = Math.random() * Math.PI * 2;
+  }
+  update() {
+    this.y -= this.speed;
+    this.wobble += 0.01;
+    if (this.y < -20) this.reset(false);
+  }
+  draw(ctx) {
+    ctx.save();
+    ctx.globalAlpha = this.alpha;
+    ctx.fillStyle = '#FF8C69';
+    ctx.beginPath();
+    ctx.arc(this.x + Math.sin(this.wobble) * 4, this.y, this.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ─── Spawn ───────────────────────────────────────────────
+function spawnBubble() {
+  const r = Math.random();
+  let type;
+  if (r < 0.06) type = 'golden';
+  else if (r < 0.12) type = 'bomb';
+  else if (r < 0.18) type = 'freeze';
+  else type = 'regular';
+  bubbles.push(new Bubble(type));
+}
+
+function spawnParticles(x, y, color, count = 12) {
+  for (let i = 0; i < count; i++) particles.push(new Particle(x, y, color));
+}
+
+// ─── Drawing ─────────────────────────────────────────────
+function drawBackground() {
+  // Warm cream background
+  ctx.fillStyle = '#FDF6F0';
+  ctx.fillRect(0, 0, W, H);
+  // Pattern dots
+  ctx.fillStyle = '#F5E1D3';
+  for (let i = 0; i < 15; i++) {
+    ctx.beginPath();
+    ctx.arc((i * 73 + 37) % W, (i * 47 + 29) % H, 4 + (i % 3) * 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawHUD() {
+  // Top bar
+  ctx.fillStyle = 'rgba(253, 246, 240, 0.95)';
+  ctx.beginPath();
+  ctx.roundRect(16, 10, W - 32, 52, 16);
+  ctx.fill();
+  ctx.strokeStyle = '#E8D5C4';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Timer pill
+  const timerColor = timer <= 10 ? '#E8784A' : '#FF8C69';
+  ctx.fillStyle = timerColor;
+  ctx.beginPath();
+  ctx.roundRect(28, 18, 72, 36, 18);
+  ctx.fill();
+  ctx.fillStyle = '#FFF';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`⏱ ${timer}s`, 64, 36);
+
+  // Score
+  ctx.fillStyle = '#5C4033';
+  ctx.font = 'bold 18px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(`${score}`, W / 2, 36);
+
+  // High score
+  ctx.fillStyle = '#B8860B';
+  ctx.font = 'bold 13px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText(`🏆 ${highScore}`, W - 36, 28);
+  ctx.fillStyle = '#8D6E63';
+  ctx.font = '10px sans-serif';
+  ctx.fillText('最高分', W - 36, 44);
+
+  // Combo
+  if (comboTimer > 0 && comboCount >= 2) {
+    const cx = W / 2;
+    const cy = 80;
+    const alpha = Math.min(1, comboTimer / 0.5);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.font = `bold ${16 + comboCount * 2}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `hsl(${30 + comboCount * 10}, 80%, ${55 - comboCount * 2}%)`;
+    ctx.fillText(`🔥 ${comboCount}连击!`, cx, cy);
+    ctx.restore();
+  }
+
+  // Freeze indicator
+  if (freezeActive) {
+    ctx.fillStyle = 'rgba(135,206,235,0.3)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.beginPath();
+    ctx.roundRect(W/2 - 60, H/2 - 20, 120, 40, 20);
+    ctx.fill();
+    ctx.fillStyle = '#4682B4';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('❄️ 时间减速!', W/2, H/2 + 5);
+  }
+}
+
+function drawMenu() {
+  drawBackground();
+  floatingBg.forEach(b => { b.update(); b.draw(ctx); });
+
+  // Title
+  const titleY = H * 0.22;
+  ctx.fillStyle = '#E8784A';
+  ctx.font = `bold ${Math.min(40, W * 0.08)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('🫧 泡泡大作战', W / 2, titleY);
+
+  ctx.fillStyle = '#8D6E63';
+  ctx.font = `${Math.min(16, W * 0.033)}px sans-serif`;
+  ctx.fillText('Bubble Pop Mania', W / 2, titleY + 32);
+
+  // Character illustration
+  const charY = titleY + 80;
+  const charR = Math.min(50, W * 0.1);
+  // Bubble character
+  ctx.fillStyle = '#FFB6A3';
+  ctx.beginPath();
+  ctx.arc(W / 2, charY, charR, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#FF8C69';
+  ctx.beginPath();
+  ctx.arc(W / 2 - charR * 0.2, charY - charR * 0.25, charR * 0.3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.beginPath();
+  ctx.arc(W / 2 - charR * 0.3, charY - charR * 0.35, charR * 0.12, 0, Math.PI * 2);
+  ctx.fill();
+  // Eyes
+  ctx.fillStyle = '#5C4033';
+  ctx.beginPath(); ctx.arc(W / 2 - charR * 0.25, charY - charR * 0.3, charR * 0.08, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(W / 2 + charR * 0.25, charY - charR * 0.3, charR * 0.08, 0, Math.PI * 2); ctx.fill();
+  // Smile
+  ctx.strokeStyle = '#5C4033';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(W / 2, charY, charR * 0.35, 0.1 * Math.PI, 0.9 * Math.PI);
+  ctx.stroke();
+
+  // High score on menu
+  if (highScore > 0) {
+    ctx.fillStyle = '#B8860B';
+    ctx.font = `bold ${Math.min(16, W * 0.033)}px sans-serif`;
+    ctx.fillText(`🏆 最高分: ${highScore}`, W / 2, charY + charR + 40);
+  }
+
+  // Rules
+  const rulesY = charY + charR + 75;
+  ctx.fillStyle = '#8D6E63';
+  ctx.font = `${Math.min(14, W * 0.028)}px sans-serif`;
+  const rules = [
+    '🫧 点击/触摸泡泡得分',
+    '⭐ 金色泡泡 +50分',
+    '💥 红色炸弹 -15分',
+    '❄️ 蓝色泡泡减速全场',
+    '🔥 连续消除触发连击加分'
+  ];
+  rules.forEach((r, i) => {
+    ctx.fillText(r, W / 2, rulesY + i * 22);
+  });
+
+  // Start button
+  const btnY = H * 0.85;
+  const btnW = Math.min(220, W * 0.5);
+  const btnH = 52;
+  const pulse = 1 + Math.sin(Date.now() * 0.004) * 0.04;
+  ctx.save();
+  ctx.translate(W / 2, btnY);
+  ctx.scale(pulse, pulse);
+  const grad = ctx.createLinearGradient(-btnW/2, 0, btnW/2, 0);
+  grad.addColorStop(0, '#FF8C69');
+  grad.addColorStop(1, '#E8784A');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.roundRect(-btnW/2, -btnH/2, btnW, btnH, btnH/2);
+  ctx.fill();
+  ctx.shadowColor = 'rgba(232,120,74,0.4)';
+  ctx.shadowBlur = 12;
+  ctx.shadowOffsetY = 3;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetY = 0;
+  ctx.fillStyle = '#FFF';
+  ctx.font = `bold ${Math.min(20, W * 0.04)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('🎮 开始游戏', 0, 0);
+  ctx.restore();
+
+  // Storage fallback note
+  if (!storageSupported) {
+    ctx.fillStyle = '#999';
+    ctx.font = '11px sans-serif';
+    ctx.fillText('⚠️ 浏览器不支持本地存储，最高分无法保存', W / 2, btnY + 40);
+  }
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(93, 64, 55, 0.6)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#FFF';
+  ctx.font = `bold ${Math.min(32, W * 0.07)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('⏸️ 暂停', W / 2, H / 2 - 20);
+  ctx.font = `${Math.min(16, W * 0.033)}px sans-serif`;
+  ctx.fillText('点击继续游戏', W / 2, H / 2 + 24);
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(93, 64, 55, 0.65)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Card
+  const cardW = Math.min(300, W * 0.8);
+  const cardH = cardW * 1.05;
+  const cx = W / 2, cy = H / 2;
+  ctx.fillStyle = '#FDF6F0';
+  ctx.beginPath();
+  ctx.roundRect(cx - cardW/2, cy - cardH/2, cardW, cardH, 24);
+  ctx.fill();
+  ctx.strokeStyle = '#E8D5C4';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  ctx.fillStyle = '#E8784A';
+  ctx.font = `bold ${Math.min(26, W * 0.055)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('游戏结束!', cx, cy - cardH * 0.35);
+
+  ctx.fillStyle = '#5C4033';
+  ctx.font = `${Math.min(16, W * 0.033)}px sans-serif`;
+  ctx.fillText(`得分: ${score}`, cx, cy - cardH * 0.18);
+  ctx.fillText(`消除数: ${totalPopped}`, cx, cy - cardH * 0.06);
+  ctx.fillText(`最大连击: ${maxCombo}`, cx, cy + cardH * 0.06);
+
+  const newRecord = updateHighScore();
+  if (newRecord) {
+    ctx.fillStyle = '#FFD700';
+    ctx.font = `bold ${Math.min(20, W * 0.042)}px sans-serif`;
+    ctx.fillText('🎉 新纪录! 🎉', cx, cy + cardH * 0.2);
+  }
+
+  ctx.fillStyle = '#B8860B';
+  ctx.font = `bold ${Math.min(16, W * 0.033)}px sans-serif`;
+  ctx.fillText(`🏆 最高分: ${highScore}`, cx, cy + cardH * 0.33);
+
+  // Play again button
+  const btnY = cy + cardH * 0.48;
+  const btnW = 180;
+  const btnH = 44;
+  const grad = ctx.createLinearGradient(cx - btnW/2, 0, cx + btnW/2, 0);
+  grad.addColorStop(0, '#FF8C69');
+  grad.addColorStop(1, '#E8784A');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.roundRect(cx - btnW/2, btnY - btnH/2, btnW, btnH, btnH/2);
+  ctx.fill();
+  ctx.fillStyle = '#FFF';
+  ctx.font = `bold ${Math.min(18, W * 0.038)}px sans-serif`;
+  ctx.fillText('🔄 再来一局', cx, btnY);
+}
+
+// ─── Game Logic ──────────────────────────────────────────
+let spawnAccum = 0;
+let lastTime = 0;
+let gameStartTime = 0;
+
+function resetGame() {
+  bubbles = [];
+  particles = [];
+  score = 0;
+  timer = 60;
+  comboTimer = 0;
+  comboCount = 0;
+  maxCombo = 0;
+  totalPopped = 0;
+  freezeActive = false;
+  freezeTimer = 0;
+  spawnAccum = 0;
+  gameStartTime = 0;
+}
+
+function startGame() {
+  initAudio();
+  resetGame();
+  gameState = STATE.PLAYING;
+  gameStartTime = performance.now();
+  lastTime = gameStartTime;
+}
+
+function popBubble(b) {
+  b.popped = true;
+  totalPopped++;
+  spawnParticles(b.x, b.y, b.color, b.type === 'bomb' ? 20 : 12);
+
+  switch (b.type) {
+    case 'golden':
+      score += BUBBLE_TYPES.golden.score;
+      playPop(1000, 0.12, 0.2);
+      break;
+    case 'bomb':
+      score = Math.max(0, score + BUBBLE_TYPES.bomb.score);
+      playPop(200, 0.2, 0.25);
+      break;
+    case 'freeze':
+      score += BUBBLE_TYPES.freeze.score;
+      freezeActive = true;
+      freezeTimer = 3;
+      playPop(800, 0.1, 0.18);
+      break;
+    default:
+      score += BUBBLE_TYPES.regular.score;
+      playPop(600, 0.08, 0.15);
+      break;
+  }
+
+  // Combo
+  comboTimer = 1.2;
+  comboCount++;
+  if (comboCount >= 3) {
+    const bonus = comboCount * 5;
+    score += bonus;
+    if (comboCount > maxCombo) maxCombo = comboCount;
+    playCombo(comboCount);
+  }
+}
+
+function handleClick(px, py) {
+  if (gameState === STATE.MENU) {
+    const btnY = H * 0.85;
+    const btnW = Math.min(220, W * 0.5);
+    const btnH = 52;
+    if (Math.abs(py - btnY) < btnH/2 && Math.abs(px - W/2) < btnW/2) {
+      startGame();
+    }
+    return;
+  }
+
+  if (gameState === STATE.PAUSED) {
+    gameState = STATE.PLAYING;
+    lastTime = performance.now();
+    return;
+  }
+
+  if (gameState === STATE.OVER) {
+    const cardW = Math.min(300, W * 0.8);
+    const cardH = cardW * 1.05;
+    const cx = W / 2, cy = H / 2;
+    const btnY = cy + cardH * 0.48;
+    const btnW = 180;
+    const btnH = 44;
+    if (Math.abs(py - btnY) < btnH/2 && Math.abs(px - cx) < btnW/2) {
+      startGame();
+    }
+    return;
+  }
+
+  if (gameState !== STATE.PLAYING) return;
+
+  // Pause button
+  if (px > W - 50 && py < 60) {
+    gameState = STATE.PAUSED;
+    return;
+  }
+
+  // Pop bubbles (reverse order for topmost first)
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    if (!b.popped && b.hit(px, py)) {
+      popBubble(b);
+      break;
+    }
+  }
+}
+
+function gameLoop(timestamp) {
+  if (!lastTime) lastTime = timestamp;
+  let dt = (timestamp - lastTime) / 1000;
+  if (dt > 0.1) dt = 0.1; // cap to avoid jumps
+  lastTime = timestamp;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // ─── MENU ──────────────────────────────────────────
+  if (gameState === STATE.MENU) {
+    drawMenu();
+    requestAnimationFrame(gameLoop);
+    return;
+  }
+
+  // ─── PLAYING / PAUSED / OVER ───────────────────────
+  drawBackground();
+  floatingBg.forEach(b => { b.update(); b.draw(ctx); });
+
+  if (gameState === STATE.PLAYING) {
+    // Timer
+    timer -= dt;
+    if (timer <= 0) {
+      timer = 0;
+      gameState = STATE.OVER;
+      playGameOver();
+      updateHighScore();
+    }
+
+    // Combo timer
+    if (comboTimer > 0) {
+      comboTimer -= dt;
+      if (comboTimer <= 0) { comboCount = 0; comboTimer = 0; }
+    }
+
+    // Freeze timer
+    if (freezeActive) {
+      freezeTimer -= dt;
+      if (freezeTimer <= 0) { freezeActive = false; freezeTimer = 0; }
+    }
+
+    // Spawn bubbles
+    const spawnRate = 0.55 + (60 - timer) * 0.006;
+    spawnAccum += dt;
+    while (spawnAccum >= spawnRate) {
+      spawnAccum -= spawnRate;
+      spawnBubble();
+    }
+
+    // Update bubbles
+    bubbles = bubbles.filter(b => {
+      const dead = b.update();
+      return !dead;
+    });
+
+    // Remove popped bubbles after animation
+    bubbles = bubbles.filter(b => {
+      if (b.popped && b.popAnim >= 1) return false;
+      return true;
+    });
+
+    // Update particles
+    particles = particles.filter(p => !p.update(dt));
+  }
+
+  // Draw all
+  bubbles.forEach(b => b.draw(ctx));
+  particles.forEach(p => p.draw(ctx));
+  drawHUD();
+
+  if (gameState === STATE.PAUSED) drawPause();
+  if (gameState === STATE.OVER) drawGameOver();
+
+  // Pause button indicator
+  if (gameState === STATE.PLAYING) {
+    ctx.fillStyle = 'rgba(141,110,99,0.4)';
+    ctx.font = '28px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText('⏸', W - 24, 36);
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// ─── Input ───────────────────────────────────────────────
+function getPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = W / rect.width;
+  const scaleY = H / rect.height;
+  const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+  const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+  return {
+    x: (clientX - rect.left) * scaleX,
+    y: (clientY - rect.top) * scaleY
+  };
+}
+
+function onDown(e) {
+  e.preventDefault();
+  const pos = getPos(e);
+  handleClick(pos.x, pos.y);
+}
+
+function onMove(e) {
+  e.preventDefault();
+}
+
+// ─── Resize ──────────────────────────────────────────────
+function resize() {
+  canvas = document.getElementById('game');
+  const wrapper = document.getElementById('wrapper');
+  
+  const maxW = Math.min(window.innerWidth, 480);
+  const maxH = Math.min(window.innerHeight, 800);
+  const ratio = 0.6; // W:H ratio
+
+  if (window.innerWidth < 480) {
+    W = window.innerWidth;
+    H = window.innerHeight;
+  } else {
+    W = maxW;
+    H = W / ratio;
+    if (H > maxH) { H = maxH; W = H * ratio; }
+  }
+
+  canvas.width = W;
+  canvas.height = H;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx = canvas.getContext('2d');
+
+  // Regenerate floating bg
+  floatingBg = [];
+  for (let i = 0; i < 18; i++) floatingBg.push(new FloatBg());
+}
+
+// ─── Init ────────────────────────────────────────────────
+function init() {
+  resize();
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', () => setTimeout(resize, 100));
+
+  canvas.addEventListener('mousedown', onDown);
+  canvas.addEventListener('mousemove', onMove);
+  canvas.addEventListener('touchstart', onDown, { passive: false });
+  canvas.addEventListener('touchmove', onMove, { passive: false });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  // Keyboard pause
+  window.addEventListener('keydown', e => {
+    if (e.key === 'Escape' || e.key === 'p' || e.key === 'P') {
+      if (gameState === STATE.PLAYING) {
+        gameState = STATE.PAUSED;
+      } else if (gameState === STATE.PAUSED) {
+        gameState = STATE.PLAYING;
+        lastTime = performance.now();
+      }
+    }
+    if ((e.key === 'Enter' || e.key === ' ') && gameState === STATE.MENU) {
+      startGame();
+    }
+  });
+
+  requestAnimationFrame(gameLoop);
+}
+
+init();
+
+console.log('🫧 Bubble Pop Mania — Ready!');
+console.log('🎮 Tap/click bubbles to pop them');
+console.log('🏆 Score: regular +10 | golden +50 | bomb -15 | freeze +5');
+console.log('🔥 Chain pops for combo bonuses!');
+console.log('❄️ Freeze bubbles slow down the field');
+console.log('⏸️ Press ESC or tap pause to pause');
+if (!storageSupported) console.warn('⚠️ localStorage not available — high scores won\'t persist');
+if (!audioSupported) console.warn('⚠️ Web Audio API not available — sound effects disabled');
+</script>
+</body>
+</html>
